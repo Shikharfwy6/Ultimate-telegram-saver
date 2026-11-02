@@ -1,0 +1,46 @@
+name: Run Telegram Bot
+
+# सिर्फ़ हाथ से चलेगा: Actions टैब -> Run Telegram Bot -> Run workflow
+on:
+  workflow_dispatch:
+
+# एक समय में सिर्फ़ एक रन। पुराना चल रहा हो तो नया उसके खत्म होने का इंतज़ार करेगा
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355       # GitHub की सीमा 6 घंटे है
+
+    steps:
+      - name: Code डाउनलोड
+        uses: actions/checkout@v4
+
+      - name: Python सेटअप
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Requirements इंस्टॉल
+        run: pip install -r requirements.txt
+
+      - name: थंबनेल वापस लाओ (पिछले रन से)
+        uses: actions/cache@v4
+        with:
+          path: thumb.json
+          key: thumb-${{ github.run_id }}
+          restore-keys: thumb-
+
+      - name: बॉट चलाओ
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+        # 5 घंटे 45 मिनट बाद बॉट शांति से बंद हो जाएगा। दोबारा चाहिए तो हाथ से Run workflow करें
+        run: timeout -s INT 20700 python -u saver_bot.py || true
