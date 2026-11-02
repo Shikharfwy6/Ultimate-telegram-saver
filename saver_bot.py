@@ -60,7 +60,7 @@ OWNER_IDS = [int(x) for x in _need("OWNER_IDS").replace(" ", "").split(",") if x
 DL_DIR = os.environ.get("DL_DIR") or os.path.join(os.getcwd(), "downloads")
 # ===========================================================================
 
-MAX_RANGE = 100      # एक रेंज में अधिकतम पोस्ट
+MAX_RANGE = 10000      # एक रेंज में अधिकतम पोस्ट
 DELAY = 1.5          # हर पोस्ट के बीच इंतज़ार (सेकंड)
 RELAY_TIMEOUT = 40   # प्राइवेट पोस्ट के बॉट तक पहुंचने का अधिकतम इंतज़ार (सेकंड)
 THUMB_FILE = "thumb.json"   # थंबनेल का file_id यहां सेव होता है
