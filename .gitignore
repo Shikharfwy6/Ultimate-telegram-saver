@@ -1,0 +1,6 @@
+downloads/
+*.session
+*.session-journal
+thumb.json
+__pycache__/
+.env
