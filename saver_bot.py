@@ -24,6 +24,7 @@ Run:      python saver_bot.py   (पहले env वैल्यू सेट �
 import os
 import re
 import json
+import html as _html
 import time
 import shutil
 import asyncio
@@ -37,7 +38,7 @@ except RuntimeError:
 import aiohttp
 from pyrogram import Client, filters, enums, idle, StopPropagation
 from pyrogram.errors import FloodWait
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= सारी वैल्यू Environment / GitHub Secrets से =================
 def _need(name):
@@ -60,7 +61,7 @@ OWNER_IDS = [int(x) for x in _need("OWNER_IDS").replace(" ", "").split(",") if x
 DL_DIR = os.environ.get("DL_DIR") or os.path.join(os.getcwd(), "downloads")
 # ===========================================================================
 
-MAX_RANGE = 10000      # एक रेंज में अधिकतम पोस्ट
+MAX_RANGE = 100      # एक रेंज में अधिकतम पोस्ट
 DELAY = 1.5          # हर पोस्ट के बीच इंतज़ार (सेकंड)
 RELAY_TIMEOUT = 40   # प्राइवेट पोस्ट के बॉट तक पहुंचने का अधिकतम इंतज़ार (सेकंड)
 THUMB_FILE = "thumb.json"   # थंबनेल का file_id यहां सेव होता है
@@ -135,10 +136,61 @@ def clean_html(html: str) -> str:
     return text.strip()
 
 
+# ---------------- बटन वाले लिंक: पोस्ट के अंदर जोड़ना ----------------
+KEEP_BUTTON_LINKS = True   # False करने पर बटन के लिंक नहीं जुड़ेंगे
+
+
+def button_rows(msg):
+    """पोस्ट के इनलाइन बटन से सिर्फ़ URL वाले बटन [(टेक्स्ट, लिंक)] की पंक्तियां।"""
+    rm = getattr(msg, "reply_markup", None)
+    rows = []
+    for row in (getattr(rm, "inline_keyboard", None) or []):
+        r = [(b.text, b.url) for b in row if getattr(b, "url", None)]
+        if r:
+            rows.append(r)
+    return rows
+
+
+def kb(rows):
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t, url=u) for t, u in r] for r in rows])
+
+
+def kb_json(rows):
+    return {"inline_keyboard": [[{"text": t, "url": u} for t, u in r] for r in rows]}
+
+
+def _visible_len(h):
+    return len(_html.unescape(re.sub(r"<[^>]+>", "", h)))
+
+
+def compose(msg, base_html, limit):
+    """सफ़ाई के बाद के टेक्स्ट में बटन के लिंक जोड़ता है।
+    लिंक टेक्स्ट में समा जाएं तो (टेक्स्ट, None) देता है।
+    लिमिट (कैप्शन 1024 / टेक्स्ट 4096) पार हो तो टेक्स्ट वैसा ही रखकर (टेक्स्ट, बटन-पंक्तियां) देता है,
+    ताकि लिंक बटन के रूप में लगे।"""
+    rows = button_rows(msg) if KEEP_BUTTON_LINKS else []
+    if not rows:
+        return base_html, None
+    block = "\n".join(
+        f'🔗 <a href="{_html.escape(u, quote=True)}">{_html.escape(t)}</a>'
+        for r in rows for t, u in r)
+    combined = f"{base_html}\n\n{block}" if base_html else block
+    if _visible_len(combined) <= limit:
+        return combined, None
+    return base_html, rows
+
+
 # ---------------- Bot API से कवर के साथ वीडियो भेजना ----------------
-async def send_video_with_cover(msg: Message, cover_id: str) -> bool:
-    """file_id से वीडियो नए कवर के साथ भेजता है। सफल होने पर True।"""
+async def send_video_with_cover(msg: Message, cover_id: str, final=None) -> bool:
+    """file_id से वीडियो नए कवर के साथ भेजता है। सफल होने पर True।
+    final = (कैप्शन_html, बटन_पंक्तियां) दें तो वही इस्तेमाल होगा, वरना मैसेज से बनेगा।"""
     v = msg.video
+    if final is None:
+        final = compose(msg, clean_html(msg.caption.html) if msg.caption else "", 1024)
+    caption, rows = final
     payload = {
         "chat_id": TARGET_CHANNEL,
         "video": v.file_id,
@@ -151,10 +203,11 @@ async def send_video_with_cover(msg: Message, cover_id: str) -> bool:
         payload["width"] = v.width
     if v.height:
         payload["height"] = v.height
-    caption = clean_html(msg.caption.html) if msg.caption else ""
     if caption:
         payload["caption"] = caption
         payload["parse_mode"] = "HTML"
+    if rows:
+        payload["reply_markup"] = kb_json(rows)
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
     async with aiohttp.ClientSession() as session:
@@ -180,24 +233,27 @@ async def _retry(func):
 
 
 async def plain_copy(client: Client, msg: Message, username: str) -> bool:
-    """पब्लिक पोस्ट चैनल में भेजता है (सफ़ाई के बाद)। भेजने लायक कुछ न बचे तो False।"""
+    """पब्लिक पोस्ट चैनल में भेजता है (सफ़ाई के बाद, बटन के लिंक जोड़कर)।
+    भेजने लायक कुछ न बचे तो False।"""
     if msg.text:
-        text = clean_html(msg.text.html)
+        text, rows = compose(msg, clean_html(msg.text.html), 4096)
         if not text:
             return False
         await _retry(lambda: client.send_message(
             TARGET_CHANNEL, text,
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=kb(rows),
         ))
         return True
 
+    cap, rows = compose(msg, clean_html(msg.caption.html) if msg.caption else "", 1024)
     kwargs = {}
-    if msg.caption:
-        kwargs["caption"] = clean_html(msg.caption.html)
+    if msg.caption or cap:
+        kwargs["caption"] = cap
         kwargs["parse_mode"] = enums.ParseMode.HTML
     await _retry(lambda: client.copy_message(
-        TARGET_CHANNEL, username, msg.id, reply_markup=None, **kwargs
+        TARGET_CHANNEL, username, msg.id, reply_markup=kb(rows), **kwargs
     ))
     return True
 
@@ -303,11 +359,12 @@ async def process_protected(client: Client, acc, msg: Message, chat_id=None) -> 
     cb = bar.update if bar else None
     try:
         kw = {}
-        if msg.caption:
-            cap = clean_html(msg.caption.html)
-            if cap:
-                kw["caption"] = cap
-                kw["parse_mode"] = enums.ParseMode.HTML
+        cap, rows = compose(msg, clean_html(msg.caption.html) if msg.caption else "", 1024)
+        if cap:
+            kw["caption"] = cap
+            kw["parse_mode"] = enums.ParseMode.HTML
+        if rows:
+            kw["reply_markup"] = kb(rows)
 
         if msg.video:
             ext = ".mp4"
@@ -375,16 +432,17 @@ async def relay_via_bot(acc, tg_id, source, msg_id, kwargs):
         RELAY.pop(tg_id, None)
 
 
-async def deliver_relayed(client: Client, rm: Message) -> str:
+async def deliver_relayed(client: Client, rm: Message, rows=None) -> str:
     """बॉट तक पहुंची पोस्ट TARGET_CHANNEL में भेजता है।"""
     try:
         kind = "other"
         if rm.video and THUMB_ID:
-            if await send_video_with_cover(rm, THUMB_ID):
+            cap = rm.caption.html if rm.caption else ""
+            if await send_video_with_cover(rm, THUMB_ID, final=(cap, rows)):
                 return "video"
             kind = "fallback"   # कवर फेल हुआ तो पुराने थंबनेल के साथ
         await _retry(lambda: client.copy_message(
-            TARGET_CHANNEL, rm.chat.id, rm.id, reply_markup=None
+            TARGET_CHANNEL, rm.chat.id, rm.id, reply_markup=kb(rows)
         ))
         return kind
     finally:
@@ -398,13 +456,14 @@ async def process_private(client, acc, tg_id, msg: Message, source, chat_id=None
     """Return: video / other / fallback / skipped"""
     # सिर्फ़ टेक्स्ट वाली पोस्ट: सेव बंद हो तब भी टेक्स्ट भेजा जा सकता है
     if msg.text:
-        text = clean_html(msg.text.html)
+        text, rows = compose(msg, clean_html(msg.text.html), 4096)
         if not text:
             return "skipped"
         await _retry(lambda: client.send_message(
             TARGET_CHANNEL, text,
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=kb(rows),
         ))
         return "other"
 
@@ -413,9 +472,10 @@ async def process_private(client, acc, tg_id, msg: Message, source, chat_id=None
         return await process_protected(client, acc, msg, chat_id)
 
     # फॉरवर्डिंग ON -> बिना डाउनलोड के रिले
+    cap, rows = compose(msg, clean_html(msg.caption.html) if msg.caption else "", 1024)
     kwargs = {}
-    if msg.caption:
-        kwargs["caption"] = clean_html(msg.caption.html)
+    if msg.caption or cap:
+        kwargs["caption"] = cap
         kwargs["parse_mode"] = enums.ParseMode.HTML
     try:
         rm = await relay_via_bot(acc, tg_id, source, msg.id, kwargs)
@@ -423,7 +483,7 @@ async def process_private(client, acc, tg_id, msg: Message, source, chat_id=None
         # रिले फेल हुआ (चैनल ने रोका, या बॉट तक नहीं पहुंचा) -> डाउनलोड वाला तरीका
         print("relay fail, download वाला तरीका:", e)
         return await process_protected(client, acc, msg, chat_id)
-    return await deliver_relayed(client, rm)
+    return await deliver_relayed(client, rm, rows)
 
 
 # बॉट की चैट में यूज़र अकाउंट से आई पोस्ट पकड़ता है (बाकी हैंडलर से पहले)
