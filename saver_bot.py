@@ -25,6 +25,7 @@ import os
 import re
 import json
 import html as _html
+from urllib.parse import urlparse
 import time
 import shutil
 import asyncio
@@ -118,11 +119,44 @@ _EMPTY_TAG = re.compile(
 )
 
 
+# इन साइटों के लिंक कभी नहीं हटते (बाकी सब लिंक हटते हैं)। ज़रूरत हो तो यहां और जोड़ें।
+KEEP_DOMAINS = (
+    "drive.google.com", "docs.google.com", "drive.usercontent.google.com",
+    "mega.nz", "mega.io", "mega.co.nz",
+)
+_A_FULL = re.compile(r"<a\b[^>]*?\bhref=([\"'])(.*?)\1[^>]*>.*?</a>", re.I | re.S)
+_KEEP_URL = re.compile(
+    r"(?<![\w@./-])(?:https?://)?(?:[\w-]+\.)*(?:"
+    + "|".join(re.escape(d) for d in KEEP_DOMAINS)
+    + r")(?:/[^\s<]*)?", re.I)
+
+
+def _keep_host(url: str) -> bool:
+    try:
+        u = _html.unescape(url).strip()
+        host = (urlparse(u if "//" in u else "//" + u).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == d or host.endswith("." + d) for d in KEEP_DOMAINS)
+
+
 def clean_html(html: str) -> str:
-    """@username, #hashtag, लिंक और टेक्स्ट-लिंक हटा देता है।"""
+    """@username, #hashtag, लिंक और टेक्स्ट-लिंक हटा देता है।
+    पर Google Drive और Mega के लिंक (सीधे लिखे हों या टेक्स्ट-लिंक) जैसे हैं वैसे रहते हैं।"""
     if not html or not CLEAN_CAPTIONS:
         return html or ""
-    text = _A_TAG.sub("", html)
+
+    # रखने वाले लिंक अलग रख दो, सफ़ाई के बाद वापस लगा देंगे
+    keep = []
+
+    def stash(piece):
+        keep.append(piece)
+        return f"\x00K{len(keep) - 1}\x00"
+
+    text = _A_FULL.sub(lambda m: stash(m.group(0)) if _keep_host(m.group(2)) else m.group(0), html)
+    text = _KEEP_URL.sub(lambda m: stash(m.group(0)), text)
+
+    text = _A_TAG.sub("", text)
     text = _URL.sub("", text)
     text = _MENTION.sub("", text)
     text = _HASHTAG.sub("", text)
@@ -133,6 +167,9 @@ def clean_html(html: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    for i, piece in enumerate(keep):
+        text = text.replace(f"\x00K{i}\x00", piece)
     return text.strip()
 
 
@@ -511,6 +548,8 @@ async def start_cmd(client: Client, message: Message):
         "🎞 वीडियो पर नया थंबनेल लगेगा\n"
         "🖼 फ़ोटो/फ़ाइल/ऑडियो/टेक्स्ट जैसे हैं वैसे ही चैनल में जाएँगे\n"
         "🔒 जिस प्राइवेट चैनल में सेव बंद है, वहाँ से डाउनलोड करके भेजा जाता है\n\n"
+        "/bucket - कई लिंक/रेंज जमा करके बारी-बारी चलाएँ (आखिर में end लिखें)\n"
+        "/resume - अधूरा बकेट जारी करें\n"
         "/thumb - सेव थंबनेल देखें\n"
         "/delthumb - थंबनेल हटाएँ\n"
         "/cancel - चल रहा टास्क रोकें",
@@ -537,11 +576,48 @@ async def del_thumb(client: Client, message: Message):
 @app.on_message(filters.command("cancel") & filters.private & owner_filter)
 async def cancel_cmd(client: Client, message: Message):
     uid = message.from_user.id
+    if uid in BUCKET_COLLECT:
+        BUCKET_COLLECT.pop(uid, None)
+        return await message.reply_text("❌ बकेट में जमा किए लिंक हटा दिए गए।")
     if uid in RUNNING:
         CANCEL.add(uid)
-        await message.reply_text("❌ टास्क रोका जा रहा है...")
+        await message.reply_text("❌ टास्क रोका जा रहा है... (चल रही पोस्ट पूरी होते ही रुकेगा)")
     else:
         await message.reply_text("कोई टास्क नहीं चल रहा।")
+
+
+@app.on_message(filters.command("bucket") & filters.private & owner_filter)
+async def bucket_cmd(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid in RUNNING:
+        return await message.reply_text("⚠️ पहले वाला टास्क चल रहा है। रोकने के लिए /cancel")
+    BUCKET_COLLECT[uid] = []
+    await message.reply_text(
+        "🪣 <b>बकेट मोड चालू</b>\n\n"
+        "अब सारे लिंक भेजिए (एक लाइन में एक लिंक, कई मैसेज में भी भेज सकते हैं):\n"
+        "<code>https://t.me/c/1234567890/10402-10497</code>\n"
+        "<code>https://t.me/c/1234567890/14237-14459</code>\n\n"
+        "सारे लिंक भेजकर आखिर में <code>end</code> लिखिए। "
+        "फिर बॉट एक-एक करके सब रेंज चलाएगा।\n"
+        "रद्द करने के लिए /cancel",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.command("resume") & filters.private & owner_filter)
+async def resume_cmd(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid in RUNNING:
+        return await message.reply_text("⚠️ पहले वाला टास्क चल रहा है। रोकने के लिए /cancel")
+    _, jobs = load_bucket()
+    if not jobs:
+        return await message.reply_text("कोई अधूरा बकेट नहीं है।")
+    if any(j["private"] for j in jobs):
+        err = private_error()
+        if err:
+            return await message.reply_text(err)
+    await message.reply_text(f"🪣 अधूरा बकेट जारी: {len(jobs)} रेंज बाकी।")
+    await run_bucket(client, message, uid, jobs)
 
 
 # बॉट को सीधे फ़ोटो भेजेंगे तो वही नया थंबनेल बनेगा
@@ -554,143 +630,351 @@ async def set_thumb(client: Client, message: Message):
     await message.reply_text("✅ थंबनेल सेव हो गया। अब चैनल का लिंक भेजिए।")
 
 
+# ---------------- लिंक पार्स / बकेट के औज़ार ----------------
+BUCKET_FILE = "bucket.json"      # अधूरा बकेट यहां सेव रहता है (/resume के लिए)
+BUCKET_MAX_RANGE = 5000          # बकेट में हर रेंज की अधिकतम पोस्ट
+BUCKET_COLLECT = {}              # uid -> [jobs]  (लिंक जमा हो रहे हैं)
+END_WORDS = {"end", "/end", "done", "खत्म", "ख़त्म"}
+STAT_KEYS = ("found", "videos", "others", "fallback", "skipped", "deleted", "failed")
+ABORT_AFTER = 5                  # लगातार इतने फेच-एरर पर रेंज छोड़ दी जाती है
+
+
+def parse_jobs(text):
+    """टेक्स्ट से सारे लिंक/रेंज निकालता है, उसी क्रम में जिसमें लिखे हैं।"""
+    found = []
+    for m in PRIV_RE.finditer(text):
+        found.append((m.start(), True, m))
+    for m in LINK_RE.finditer(text):
+        found.append((m.start(), False, m))
+    found.sort(key=lambda x: x[0])
+    jobs = []
+    for _, priv, m in found:
+        a = int(m.group("a"))
+        b = int(m.group("b") or a)
+        if b < a:
+            a, b = b, a
+        if priv:
+            source, key = int("-100" + m.group("chat")), m.group("chat")
+        else:
+            source = m.group("user")
+            key = source.lower()
+        jobs.append({"private": priv, "source": source, "key": key,
+                     "start": a, "end": b, "next": a})
+    return jobs
+
+
+def _mk(j, a, b):
+    d = dict(j)
+    d["start"], d["end"], d["next"] = a, b, a
+    return d
+
+
+def dedupe_jobs(jobs):
+    """एक ही चैनल की दोहराई गई पोस्ट ID हटाता है। return: (नई jobs, हटी गिनती)"""
+    seen, out, removed = {}, [], 0
+    for j in jobs:
+        s = seen.setdefault((j["private"], j["key"]), set())
+        run_start = prev = None
+        for i in range(j["start"], j["end"] + 1):
+            if i in s:
+                removed += 1
+                if run_start is not None:
+                    out.append(_mk(j, run_start, prev))
+                    run_start = None
+                continue
+            s.add(i)
+            if run_start is None:
+                run_start = i
+            prev = i
+        if run_start is not None:
+            out.append(_mk(j, run_start, prev))
+    return out, removed
+
+
+def save_bucket(uid, jobs):
+    try:
+        with open(BUCKET_FILE, "w", encoding="utf-8") as f:
+            json.dump({"uid": uid, "jobs": jobs}, f)
+    except Exception as e:
+        print("bucket save error:", e)
+
+
+def load_bucket():
+    """return: (uid, बाकी jobs)"""
+    try:
+        with open(BUCKET_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        jobs = [j for j in d.get("jobs", []) if j.get("next", j["start"]) <= j["end"]]
+        return d.get("uid"), jobs
+    except Exception:
+        return None, []
+
+
+def clear_bucket():
+    save_bucket(None, [])
+
+
+def new_stats():
+    d = {k: 0 for k in STAT_KEYS}
+    d["last_error"] = ""
+    return d
+
+
+def merge_stats(total, s):
+    for k in STAT_KEYS:
+        total[k] += s[k]
+    if s["last_error"]:
+        total["last_error"] = s["last_error"]
+
+
+def stats_text(s):
+    return (
+        f"📦 मौजूद पोस्ट मिलीं: {s['found']}\n"
+        f"🎞 नए थंबनेल के साथ वीडियो: {s['videos']}\n"
+        f"🖼 बाकी: {s['others']}\n"
+        f"↩️ पुराने थंबनेल के साथ गए: {s['fallback']}\n"
+        f"⏭ सफ़ाई के बाद खाली (छोड़े): {s['skipped']}\n"
+        f"🗑 डिलीट पोस्ट (छोड़ी): {s['deleted']}\n"
+        f"❌ फेल: {s['failed']}"
+    )
+
+
+def private_error():
+    if not user.is_connected or not USER_TG_ID:
+        return "❌ यूज़र अकाउंट कनेक्ट नहीं है। SESSION_STRING जांचें।"
+    if not BOT_USERNAME:
+        return "❌ बॉट का यूज़रनेम नहीं मिला। बॉट रीस्टार्ट कीजिए।"
+    return None
+
+
+async def process_one(client, reader, acc, tg_id, job, msg_id, st, chat_id):
+    """एक पोस्ट प्रोसेस करता है और st की गिनती बढ़ाता है।
+    return: "found" (पोस्ट मिली) / "gone" (डिलीट/खाली) / "err" (फेच एरर)"""
+    source = job["source"]
+    try:
+        msg = await _retry(lambda: reader.get_messages(source, msg_id))
+    except Exception as e:
+        print("fetch error:", msg_id, e)
+        st["failed"] += 1
+        st["last_error"] = f"{type(e).__name__}: {e}"
+        return "err"
+
+    # डिलीट हुई / खाली पोस्ट: छोड़ो, अगली पर जाओ
+    if not msg or msg.empty or msg.service:
+        st["deleted"] += 1
+        return "gone"
+
+    st["found"] += 1
+    try:
+        if job["private"]:
+            res = await process_private(client, acc, tg_id, msg, source, chat_id)
+        elif msg.video and THUMB_ID:
+            if await send_video_with_cover(msg, THUMB_ID):
+                res = "video"
+            else:
+                # कवर फेल हुआ तो वीडियो पुराने थंबनेल के साथ भेज दो
+                await plain_copy(client, msg, source)
+                res = "fallback"
+        else:
+            res = "other" if await plain_copy(client, msg, source) else "skipped"
+        st[{"video": "videos", "fallback": "fallback", "skipped": "skipped"}.get(res, "others")] += 1
+    except Exception as e:
+        print("error:", msg_id, e)
+        st["failed"] += 1
+        st["last_error"] = f"{type(e).__name__}: {e}"
+    return "found"
+
+
+async def run_job(client, message, uid, job, header="", persist=None):
+    """एक रेंज चलाता है। persist=(uid, jobs) दें तो हर पोस्ट के बाद प्रगति bucket.json में सेव होती है।
+    return: (cancelled, stats)"""
+    st = new_stats()
+    st["aborted"] = False
+    acc = tg_id = None
+    if job["private"]:
+        acc, tg_id = user, USER_TG_ID
+    reader = acc if job["private"] else client
+    start_id = job.get("next", job["start"])
+    end_id = job["end"]
+    prefix = f"{header} " if header else ""
+    status = await message.reply_text(f"⏳ {prefix}शुरू कर रहा हूँ...")
+    cancelled = False
+    errs = 0
+
+    try:
+        for msg_id in range(start_id, end_id + 1):
+            if uid in CANCEL:
+                cancelled = True
+                break
+
+            r = await process_one(client, reader, acc, tg_id, job, msg_id, st, message.chat.id)
+            job["next"] = msg_id + 1
+            if persist:
+                save_bucket(*persist)
+
+            if r == "err":
+                errs += 1
+                if errs >= ABORT_AFTER:
+                    st["aborted"] = True
+                    job["next"] = end_id + 1
+                    if persist:
+                        save_bucket(*persist)
+                    await message.reply_text(
+                        f"⚠️ {prefix}लगातार {ABORT_AFTER} एरर, यह रेंज छोड़ दी।\n"
+                        f"आखिरी एरर: {st['last_error'][:300]}\n"
+                        "(प्राइवेट चैनल हो तो पक्का करें कि अकाउंट उसका मेंबर है)")
+                    break
+            else:
+                errs = 0
+
+            if r == "found" and st["found"] % 5 == 0:
+                try:
+                    await status.edit_text(f"⏳ {prefix}ID {msg_id} / {end_id}\n{stats_text(st)}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3 if r == "gone" else DELAY)
+    finally:
+        if tg_id:
+            RELAY.pop(tg_id, None)
+    return cancelled, st
+
+
+async def run_bucket(client, message, uid, jobs):
+    """बकेट की सारी रेंज बारी-बारी चलाता है।"""
+    RUNNING.add(uid)
+    CANCEL.discard(uid)
+    total = new_stats()
+    cancelled = False
+    try:
+        save_bucket(uid, jobs)
+        n = len(jobs)
+        for i, job in enumerate(jobs, 1):
+            if job.get("next", job["start"]) > job["end"]:
+                continue
+            header = f"[{i}/{n}] {job['start']}-{job['end']}"
+            cancelled, st = await run_job(client, message, uid, job, header, persist=(uid, jobs))
+            merge_stats(total, st)
+            if cancelled:
+                break
+            if not st["aborted"]:
+                await message.reply_text(
+                    f"✅ {header} पूरी\nपोस्ट मिलीं: {st['found']} | फेल: {st['failed']}")
+    finally:
+        RUNNING.discard(uid)
+        CANCEL.discard(uid)
+
+    if cancelled:
+        await message.reply_text(
+            "❌ बकेट रोका गया। बाकी रेंज सेव हैं, /resume से जारी करें।\n\n" + stats_text(total))
+    else:
+        clear_bucket()
+        text = "🏁 <b>बकेट पूरा हुआ</b>\n\n" + stats_text(total)
+        if total["failed"] and total["last_error"]:
+            text += f"\n\nआखिरी एरर:\n{total['last_error'][:300]}"
+        await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+
+
+async def bucket_collect(client, message):
+    """/bucket के बाद आए मैसेज: लिंक जमा करता है, 'end' पर बकेट शुरू करता है।"""
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    jobs = BUCKET_COLLECT[uid]
+
+    if text.lower() in END_WORDS:
+        if not jobs:
+            BUCKET_COLLECT.pop(uid, None)
+            return await message.reply_text("⚠️ कोई लिंक जमा नहीं हुआ। /bucket से दोबारा शुरू कीजिए।")
+        if any(j["private"] for j in jobs):
+            err = private_error()
+            if err:
+                return await message.reply_text(err)
+        BUCKET_COLLECT.pop(uid, None)
+        jobs, removed = dedupe_jobs(jobs)
+        if removed:
+            await message.reply_text(f"ℹ️ {removed} दोहराई गई पोस्ट ID हटा दीं (एक ही पोस्ट दो बार नहीं जाएगी)।")
+        if not THUMB_ID:
+            await message.reply_text("ℹ️ थंबनेल सेव नहीं है, इसलिए वीडियो बिना नए थंबनेल के जाएँगे।")
+        posts = sum(j["end"] - j["start"] + 1 for j in jobs)
+        await message.reply_text(f"🪣 बकेट शुरू: {len(jobs)} रेंज, कुल करीब {posts} पोस्ट।\nरोकने के लिए /cancel")
+        return await run_bucket(client, message, uid, jobs)
+
+    new = parse_jobs(text)
+    if not new:
+        return await message.reply_text(
+            "⚠️ इसमें कोई सही लिंक नहीं मिला। लिंक भेजिए, या शुरू करने के लिए end लिखिए।")
+    for j in new:
+        if j["end"] - j["start"] + 1 > BUCKET_MAX_RANGE:
+            j["end"] = j["start"] + BUCKET_MAX_RANGE - 1
+    base = len(jobs)
+    jobs.extend(new)
+    lines = "\n".join(
+        f"{base + i}. {j['start']}-{j['end']}" for i, j in enumerate(new[:15], 1))
+    more = f"\n… और {len(new) - 15}" if len(new) > 15 else ""
+    posts = sum(j["end"] - j["start"] + 1 for j in jobs)
+    await message.reply_text(
+        f"✅ {len(new)} रेंज जुड़ीं (कुल {len(jobs)} रेंज, करीब {posts} पोस्ट)\n\n{lines}{more}\n\n"
+        "और लिंक भेजिए, या शुरू करने के लिए <code>end</code> लिखिए।",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
 # ---------------- लिंक हैंडलर ----------------
 @app.on_message(
     filters.text & filters.private & owner_filter
-    & ~filters.command(["start", "thumb", "delthumb", "cancel"])
+    & ~filters.command(["start", "thumb", "delthumb", "cancel", "bucket", "resume"])
 )
 async def link_handler(client: Client, message: Message):
     uid = message.from_user.id
 
-    priv_links = list(PRIV_RE.finditer(message.text))
-    is_private = bool(priv_links)
-    links = priv_links if is_private else list(LINK_RE.finditer(message.text))
-    m = links[0] if links else None
-    if not m:
+    if uid in BUCKET_COLLECT:              # /bucket चल रहा है तो मैसेज उसी का हिस्सा है
+        return await bucket_collect(client, message)
+
+    jobs = parse_jobs(message.text)
+    if not jobs:
         return await message.reply_text(
-            "⚠️ सही लिंक भेजिए, जैसे:\n<code>https://t.me/channelname/123-150</code>",
+            "⚠️ सही लिंक भेजिए, जैसे:\n<code>https://t.me/channelname/123-150</code>\n\n"
+            "कई लिंक एक साथ चलाने के लिए /bucket",
             parse_mode=enums.ParseMode.HTML,
         )
 
     if uid in RUNNING:
         return await message.reply_text("⚠️ पहले वाला टास्क चल रहा है। रोकने के लिए /cancel")
 
-    acc = tg_id = None
-    if is_private:
-        source = int("-100" + m.group("chat"))
-        key = m.group("chat")
-        if not user.is_connected or not USER_TG_ID:
-            return await message.reply_text("❌ यूज़र अकाउंट कनेक्ट नहीं है। SESSION_STRING जांचें।")
-        if not BOT_USERNAME:
-            return await message.reply_text("❌ बॉट का यूज़रनेम नहीं मिला। बॉट रीस्टार्ट कीजिए।")
-        acc, tg_id = user, USER_TG_ID
-    else:
-        source = m.group("user")
-        key = source.lower()
+    job = jobs[0]
+    # दो अलग लिंक भेजे हों (पहला = शुरू, दूसरा = अंत) तो भी रेंज मानो
+    if len(jobs) >= 2 and jobs[1]["key"] == job["key"] and jobs[1]["private"] == job["private"]:
+        job["end"] = jobs[1]["start"]
+    if job["end"] < job["start"]:
+        job["start"], job["end"] = job["end"], job["start"]
+    job["next"] = job["start"]
+    if job["end"] - job["start"] + 1 > MAX_RANGE:
+        job["end"] = job["start"] + MAX_RANGE - 1
+        await message.reply_text(
+            f"ℹ️ एक बार में अधिकतम {MAX_RANGE} पोस्ट। ID {job['start']} से {job['end']} तक ले रहा हूँ।\n"
+            "बड़ी रेंज के लिए /bucket इस्तेमाल करें।")
+
+    if job["private"]:
+        err = private_error()
+        if err:
+            return await message.reply_text(err)
 
     if not THUMB_ID:
         await message.reply_text("ℹ️ थंबनेल सेव नहीं है, इसलिए वीडियो बिना नए थंबनेल के जाएँगे।")
 
-    start_id = int(m.group("a"))
-    end_id = int(m.group("b") or start_id)
-    # दो अलग लिंक भेजे हों (पहला = शुरू, दूसरा = अंत) तो भी रेंज मानो
-    if len(links) >= 2:
-        k2 = links[1].group("chat") if is_private else links[1].group("user").lower()
-        if k2 == key:
-            end_id = int(links[1].group("a"))
-    if end_id < start_id:
-        start_id, end_id = end_id, start_id
-    if end_id - start_id + 1 > MAX_RANGE:
-        end_id = start_id + MAX_RANGE - 1
-        await message.reply_text(f"ℹ️ एक बार में अधिकतम {MAX_RANGE} पोस्ट। ID {start_id} से {end_id} तक ले रहा हूँ।")
-
     RUNNING.add(uid)
     CANCEL.discard(uid)
-    videos = others = fallback = failed = skipped = deleted = 0
-    found = 0
-    status = await message.reply_text("⏳ शुरू कर रहा हूँ...")
-    reader = acc if is_private else client
-    last_error = ""
-
     try:
-        for msg_id in range(start_id, end_id + 1):
-            if uid in CANCEL:
-                break
-
-            try:
-                msg = await _retry(lambda: reader.get_messages(source, msg_id))
-            except Exception as e:
-                print("fetch error:", msg_id, e)
-                last_error = f"{type(e).__name__}: {e}"
-                failed += 1
-                await asyncio.sleep(DELAY)
-                continue
-
-            # डिलीट हुई / खाली पोस्ट: छोड़ो, अगली पर जाओ
-            if not msg or msg.empty or msg.service:
-                deleted += 1
-                await asyncio.sleep(0.3)
-                continue
-
-            found += 1
-            try:
-                if is_private:
-                    res = await process_private(client, acc, tg_id, msg, source, message.chat.id)
-                elif msg.video and THUMB_ID:
-                    if await send_video_with_cover(msg, THUMB_ID):
-                        res = "video"
-                    else:
-                        # कवर फेल हुआ तो वीडियो पुराने थंबनेल के साथ भेज दो
-                        await plain_copy(client, msg, source)
-                        res = "fallback"
-                else:
-                    res = "other" if await plain_copy(client, msg, source) else "skipped"
-
-                if res == "video":
-                    videos += 1
-                elif res == "fallback":
-                    fallback += 1
-                elif res == "skipped":
-                    skipped += 1
-                else:
-                    others += 1
-            except Exception as e:
-                print("error:", msg_id, e)
-                last_error = f"{type(e).__name__}: {e}"
-                failed += 1
-
-            if found % 5 == 0:
-                try:
-                    await status.edit_text(
-                        f"⏳ पोस्ट ID {msg_id} / {end_id}\n"
-                        f"🎞 नए थंबनेल के साथ: {videos}\n"
-                        f"🖼 बाकी (फ़ोटो/फ़ाइल आदि): {others}\n"
-                        f"↩️ पुराने थंबनेल के साथ: {fallback}\n"
-                        f"⏭ सफ़ाई के बाद खाली (छोड़े): {skipped}\n"
-                        f"🗑 डिलीट पोस्ट (छोड़ी): {deleted}\n❌ फेल: {failed}"
-                    )
-                except Exception:
-                    pass
-            await asyncio.sleep(DELAY)
+        cancelled, st = await run_job(client, message, uid, job)
     finally:
         RUNNING.discard(uid)
-        if tg_id:
-            RELAY.pop(tg_id, None)
-        cancelled = uid in CANCEL
         CANCEL.discard(uid)
 
     result = (
-        f"{'❌ रोका गया' if cancelled else '✅ पूरा हुआ'} (ID {start_id} से {end_id} तक)\n"
-        f"📦 मौजूद पोस्ट मिलीं: {found}\n"
-        f"🎞 नए थंबनेल के साथ वीडियो: {videos}\n"
-        f"🖼 बाकी: {others}\n"
-        f"↩️ पुराने थंबनेल के साथ गए: {fallback}\n"
-        f"⏭ सफ़ाई के बाद खाली (छोड़े): {skipped}\n"
-        f"🗑 डिलीट पोस्ट (छोड़ी): {deleted}\n"
-        f"❌ फेल: {failed}"
+        f"{'❌ रोका गया' if cancelled else '✅ पूरा हुआ'} (ID {job['start']} से {job['end']} तक)\n"
+        + stats_text(st)
     )
-    if failed and last_error:
-        result += f"\n\nआखिरी एरर:\n{last_error[:300]}"
+    if st["failed"] and st["last_error"]:
+        result += f"\n\nआखिरी एरर:\n{st['last_error'][:300]}"
     await message.reply_text(result)
 
 
@@ -715,7 +999,9 @@ async def main():
         print("   पब्लिक चैनल चलेंगे, प्राइवेट नहीं।")
 
     try:
-        await app.send_message(OWNER_IDS[0], "✅ बॉट चालू हो गया। थंबनेल/लिंक भेजें।")
+        _, pend = load_bucket()
+        extra = f"\n\n🪣 अधूरा बकेट मिला: {len(pend)} रेंज बाकी। /resume से जारी करें।" if pend else ""
+        await app.send_message(OWNER_IDS[0], "✅ बॉट चालू हो गया। थंबनेल/लिंक भेजें।" + extra)
     except Exception as e:
         print("स्टार्टअप मैसेज नहीं गया (बॉट को /start करें):", e)
 
