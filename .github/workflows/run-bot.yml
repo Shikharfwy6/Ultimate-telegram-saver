@@ -27,12 +27,14 @@ jobs:
       - name: Requirements इंस्टॉल
         run: pip install -r requirements.txt
 
-      - name: थंबनेल वापस लाओ (पिछले रन से)
+      - name: थंबनेल और अधूरा बकेट वापस लाओ (पिछले रन से)
         uses: actions/cache@v4
         with:
-          path: thumb.json
-          key: thumb-${{ github.run_id }}
-          restore-keys: thumb-
+          path: |
+            thumb.json
+            bucket.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
 
       - name: बॉट चलाओ
         env:
@@ -44,3 +46,4 @@ jobs:
           OWNER_IDS: ${{ secrets.OWNER_IDS }}
         # 5 घंटे 45 मिनट बाद बॉट शांति से बंद हो जाएगा। दोबारा चाहिए तो हाथ से Run workflow करें
         run: timeout -s INT 20700 python -u saver_bot.py || true
+        
