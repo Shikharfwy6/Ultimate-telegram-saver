@@ -4,3 +4,4 @@ downloads/
 thumb.json
 __pycache__/
 .env
+bucket.json
